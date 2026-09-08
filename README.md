@@ -24,11 +24,11 @@ The system consists of:
 
 - **MCP Servers** — declare event types, manage webhook subscriptions, deliver signed events to webhook targets
 - **MCP Client/Host application** — subscribes to events, receives and processes them, manages customer state
-- **External systems** — USGS API, Amazon Bedrock
+- **External systems** — [USGS Real-time Feed](https://earthquake.usgs.gov/earthquakes/feed/), Amazon Bedrock
 
 At a high-level, there are three major components:
 
-1. **MCP Server 1 — USGS Earthquake Feed** polls the USGS GeoJSON feed every 5 minutes,
+1. **MCP Server 1 — USGS Earthquake Feed** polls the [USGS GeoJSON feed](https://earthquake.usgs.gov/earthquakes/feed/v1.0/geojson.php) every 5 minutes,
   detects new earthquakes with cursor-based deduplication, and delivers each one as an
   `earthquake.detected` event to every subscription whose filter matches.
 1. **MCP Server 2 — Message Scheduler** fires a `briefing.trigger` event per
