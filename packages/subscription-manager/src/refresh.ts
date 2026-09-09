@@ -330,9 +330,42 @@ export interface RefreshSummary {
 // ---------------------------------------------------------------------------
 
 /**
+ * The domain attributes persisted on a subscription record for a server: the
+ * customer's earthquake filter params (MCP Server 1) or their briefing interval
+ * in hours (MCP Server 2). The field belonging to the *other* server is
+ * explicitly cleared so a record can never carry both.
+ *
+ * These are always derived from the customer's CURRENT config rather than
+ * carried over from the stored record, for two reasons:
+ *
+ * 1. The config is the source of truth. A customer who changes their briefing
+ *    interval (or their filters) must see the stored record follow, otherwise it
+ *    drifts permanently out of sync with the `inputSchema` actually registered
+ *    on the MCP server by {@link buildInputSchema}.
+ * 2. It stops a legacy-shaped stored record from poisoning the write. Carrying
+ *    these fields forward verbatim meant a record written under an older schema
+ *    — for example a cron-string `schedule` from before the interval-based
+ *    migration — failed the Data API's validation with a 400 on every refresh.
+ *    Because {@link RefreshDependencies.upsertSubscriptionRecord} only falls
+ *    back to creating on a 404, that wedged the refresh permanently: the
+ *    subscription could never be re-registered, so the Webhook Receiver could
+ *    not resolve the id the MCP server was delivering under and rejected every
+ *    delivery with a 401.
+ */
+function domainFieldsFor(
+  server: ServerDescriptor,
+  config: CustomerConfig,
+): Pick<SubscriptionRecord, "filterParams" | "schedule"> {
+  return server.eventName === EVENT_NAME_EARTHQUAKE_DETECTED
+    ? { filterParams: config.subscriptionParams, schedule: undefined }
+    : { schedule: config.briefingSchedule, filterParams: undefined };
+}
+
+/**
  * Refresh one expiring subscription via `events/subscribe` and persist the
  * result. Re-supplies the existing secret unless `rotateSecret` is set, in which
- * case a fresh `whsec_` is generated and stored.
+ * case a fresh `whsec_` is generated and stored. The persisted filter/schedule
+ * fields are re-derived from the customer's config (see {@link domainFieldsFor}).
  */
 async function refreshOne(
   deps: RefreshDependencies,
@@ -360,6 +393,7 @@ async function refreshOne(
   const nowIso = options.now.toISOString();
   await deps.upsertSubscriptionRecord({
     ...subscription,
+    ...domainFieldsFor(server, customer.config),
     subscriptionId: result.subscriptionId,
     secret,
     expiresAt: result.expiresAt,
@@ -408,9 +442,7 @@ async function recreateMissing(
     eventName: server.eventName,
     callbackUrl,
     secret,
-    ...(server.eventName === EVENT_NAME_EARTHQUAKE_DETECTED
-      ? { filterParams: customer.config.subscriptionParams }
-      : { schedule: customer.config.briefingSchedule }),
+    ...domainFieldsFor(server, customer.config),
     createdAt: nowIso,
     expiresAt: result.expiresAt,
     lastRefreshedAt: nowIso,
@@ -814,8 +846,11 @@ const defaultUpsertSubscriptionRecord: RefreshDependencies["upsertSubscriptionRe
       return;
     }
     if (put.statusCode !== 404) {
+      // Include the response body: the Data API returns the specific validation
+      // failure there, and without it a 400 is undiagnosable from logs alone.
       throw new Error(
-        `Data API PUT subscription ${record.subscriptionId} returned ${put.statusCode}`,
+        `Data API PUT subscription ${record.subscriptionId} returned ` +
+          `${put.statusCode}: ${truncate(put.body)}`,
       );
     }
 
@@ -827,7 +862,19 @@ const defaultUpsertSubscriptionRecord: RefreshDependencies["upsertSubscriptionRe
     const post = await dataApiFetch("POST", postUrl, record);
     if (post.statusCode < 200 || post.statusCode >= 300) {
       throw new Error(
-        `Data API POST subscription for ${record.customerId} returned ${post.statusCode}`,
+        `Data API POST subscription for ${record.customerId} returned ` +
+          `${post.statusCode}: ${truncate(post.body)}`,
       );
     }
   };
+
+/**
+ * Clamp a Data API response body to a bounded length for inclusion in an error
+ * message, so a large or unexpected body cannot flood the logs.
+ */
+function truncate(body: string, max = 200): string {
+  const collapsed = body.replace(/\s+/g, " ").trim();
+  return collapsed.length <= max
+    ? collapsed
+    : `${collapsed.slice(0, max)}...(truncated)`;
+}

@@ -154,15 +154,59 @@ function feedUrlFromEnv(): string {
 // ---------------------------------------------------------------------------
 
 /**
- * Fetch and JSON-parse the USGS GeoJSON feed.
+ * Delays (ms) between USGS feed fetch attempts. Two entries means up to three
+ * attempts (1 initial + 2 retries), keeping the worst case (~1.25s of backoff
+ * plus the attempts themselves) far inside the poller Lambda's 60s timeout and
+ * its 5-minute schedule.
+ *
+ * The USGS feed is a third-party endpoint reached over the public internet, and
+ * a bare single-shot `fetch` turned any transient blip — a reset connection, a
+ * DNS hiccup, a 503 — into a failed poll cycle and a paging alarm, at a rate of
+ * roughly one a week.
+ */
+export const FEED_RETRY_DELAYS_MS = [250, 1_000] as const;
+
+/** Injectable sleep so tests never wait on real timers. */
+type Sleep = (ms: number) => Promise<void>;
+
+const realSleep: Sleep = (ms) =>
+  new Promise((resolve) => setTimeout(resolve, ms));
+
+let sleepImpl: Sleep = realSleep;
+
+/**
+ * Override the retry sleep. Test seam only — production code never calls this.
+ * Pass `undefined` to reset to the real timer-based sleep.
+ */
+export function setFeedRetrySleepForTesting(override: Sleep | undefined): void {
+  sleepImpl = override ?? realSleep;
+}
+
+/**
+ * Whether an HTTP status is worth retrying. 429 and 5xx are transient; other
+ * 4xx responses indicate a permanent problem (typically a misconfigured
+ * `USGS_FEED_URL`) that retrying would only delay surfacing.
+ */
+function isRetryableStatus(status: number): boolean {
+  return status === 429 || status >= 500;
+}
+
+/**
+ * Fetch and JSON-parse the USGS GeoJSON feed, retrying transient failures.
+ *
+ * Network-level rejections and retryable statuses ({@link isRetryableStatus})
+ * are retried with the {@link FEED_RETRY_DELAYS_MS} backoff. Each retry logs a
+ * `WARN`, which the stack's log-error metric filter counts (it matches both
+ * `ERROR` and `WARN`) — so a blip that the retry papers over is still visible
+ * and still alarms, while no longer failing the poll cycle or delaying events.
  *
  * @param feedUrl  Feed URL; defaults to the `USGS_FEED_URL` environment
  *                 variable supplied by the CDK stack.
  * @param fetchImpl  `fetch` implementation; defaults to the global `fetch`
  *                 (Node 20+). Injectable for tests.
  *
- * @throws Error when the response status is not 2xx (or the network call
- *   rejects). The caller (the Lambda handler, task 6.5) treats a throw here as
+ * @throws Error when a non-retryable status is returned, or when every attempt
+ *   fails. The caller (the Lambda handler, task 6.5) treats a throw here as
  *   "USGS unavailable", exits without emitting, and leaves the cursor unchanged
  *   so the poll is retried next cycle (Requirement 15.4).
  */
@@ -170,11 +214,53 @@ export async function fetchUsgsFeed(
   feedUrl: string = feedUrlFromEnv(),
   fetchImpl: FetchLike = fetch as unknown as FetchLike,
 ): Promise<UsgsFeatureCollection> {
-  const response = await fetchImpl(feedUrl);
-  if (!response.ok) {
-    throw new Error(`USGS feed request failed with status ${response.status}`);
+  const maxAttempts = FEED_RETRY_DELAYS_MS.length + 1;
+  let lastError: Error | undefined;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    let outcome:
+      | { feed: UsgsFeatureCollection }
+      | { error: Error; retryable: boolean };
+
+    try {
+      const response = await fetchImpl(feedUrl);
+      outcome = response.ok
+        ? { feed: (await response.json()) as UsgsFeatureCollection }
+        : {
+            error: new Error(
+              `USGS feed request failed with status ${response.status}`,
+            ),
+            retryable: isRetryableStatus(response.status),
+          };
+    } catch (cause) {
+      // Network-level failure (connection reset, DNS, TLS) or an unparseable
+      // body — always treated as transient.
+      outcome = {
+        error: cause instanceof Error ? cause : new Error(String(cause)),
+        retryable: true,
+      };
+    }
+
+    if ("feed" in outcome) {
+      return outcome.feed;
+    }
+
+    lastError = outcome.error;
+    if (!outcome.retryable || attempt === maxAttempts) {
+      break;
+    }
+
+    const retryInMs = FEED_RETRY_DELAYS_MS[attempt - 1];
+    console.warn("USGS feed fetch failed; retrying", {
+      attempt,
+      maxAttempts,
+      retryInMs,
+      error: lastError.message,
+    });
+    await sleepImpl(retryInMs);
   }
-  return (await response.json()) as UsgsFeatureCollection;
+
+  throw lastError ?? new Error("USGS feed request failed");
 }
 
 // ---------------------------------------------------------------------------

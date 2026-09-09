@@ -46,12 +46,14 @@ const QUEUE_URL =
 const DATA_API_URL = "https://api.earthquake-agent.example.com";
 
 const SUBSCRIPTION_ID = "22222222-2222-4222-8222-222222222222";
+const CUSTOMER_ID = "33333333-3333-4333-8333-333333333333";
+const EVENT_ID = "11111111-1111-4111-8111-111111111111";
 /** A structurally valid `whsec_` secret (prefix + base64 of 32 bytes). */
 const SECRET = `whsec_${Buffer.alloc(32, 7).toString("base64")}`;
 const WRONG_SECRET = `whsec_${Buffer.alloc(32, 9).toString("base64")}`;
 
 const PAYLOAD = JSON.stringify({
-  eventId: "11111111-1111-4111-8111-111111111111",
+  eventId: EVENT_ID,
   name: "earthquake.detected",
   timestamp: "2024-01-01T00:00:00.000Z",
   data: { earthquakeId: "us7000n123", magnitude: 5.2 },
@@ -67,7 +69,7 @@ function lookupReturningSecret(secret: string) {
       statusCode: 200,
       body: JSON.stringify({
         subscriptionId: SUBSCRIPTION_ID,
-        customerId: "33333333-3333-4333-8333-333333333333",
+        customerId: CUSTOMER_ID,
         secret,
       }),
     }),
@@ -89,12 +91,16 @@ function makeEvent(opts: {
   } as unknown as APIGatewayProxyEvent;
 }
 
-/** Sign PAYLOAD and merge the signature headers with the subscription header. */
+/**
+ * Sign a payload (PAYLOAD by default) and merge the signature headers with the
+ * subscription header.
+ */
 function signedHeaders(
   secret: string,
   options?: Parameters<typeof signWebhook>[2],
+  body: string = PAYLOAD,
 ): Record<string, string> {
-  const sig: WebhookHeaders = signWebhook(PAYLOAD, secret, options);
+  const sig: WebhookHeaders = signWebhook(body, secret, options);
   return {
     [MCP_SUBSCRIPTION_ID_HEADER]: SUBSCRIPTION_ID,
     "webhook-id": sig["webhook-id"],
@@ -139,6 +145,46 @@ describe("webhook receiver handler", () => {
       DataType: "String",
       StringValue: SUBSCRIPTION_ID,
     });
+    // FIFO: group by customer so one customer's events are serialized, and
+    // deduplicate on the event id so a re-delivery enqueues once.
+    expect(input.MessageGroupId).toBe(CUSTOMER_ID);
+    expect(input.MessageDeduplicationId).toBe(EVENT_ID);
+  });
+
+  it("falls back to content-based deduplication when the body has no eventId", async () => {
+    setSubscriptionLookupForTesting(lookupReturningSecret(SECRET));
+    sqsMock.on(SendMessageCommand).resolves({ MessageId: "m-1" });
+
+    const body = JSON.stringify({ name: "earthquake.detected", data: {} });
+    const res = await handler(
+      makeEvent({ headers: signedHeaders(SECRET, undefined, body), body }),
+    );
+
+    expect(res.statusCode).toBe(200);
+    const input = sqsMock.commandCalls(SendMessageCommand)[0].args[0].input;
+    expect(input.MessageGroupId).toBe(CUSTOMER_ID);
+    expect(input.MessageDeduplicationId).toBeUndefined();
+  });
+
+  it("returns 401 and enqueues nothing when the subscription has no customerId", async () => {
+    // Without a customerId there is no correct FIFO message group, so the
+    // delivery must not be enqueued under a guessed one.
+    setSubscriptionLookupForTesting(
+      vi.fn(
+        async (_id: string): Promise<SubscriptionLookupResult> => ({
+          statusCode: 200,
+          body: JSON.stringify({
+            subscriptionId: SUBSCRIPTION_ID,
+            secret: SECRET,
+          }),
+        }),
+      ),
+    );
+
+    const res = await handler(makeEvent({ headers: signedHeaders(SECRET) }));
+
+    expect(res.statusCode).toBe(401);
+    expect(sqsMock.commandCalls(SendMessageCommand)).toHaveLength(0);
   });
 
   it("decodes a base64-encoded body before verifying and enqueueing", async () => {

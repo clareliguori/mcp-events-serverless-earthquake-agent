@@ -27,10 +27,12 @@ export type WebhookReceiverStackProps = cdk.StackProps & SharedProps;
  * - A Lambda proxy that validates the incoming Standard Webhooks HMAC-SHA256
  *   signature and enqueues the event to SQS with the `X-MCP-Subscription-Id`
  *   value as a message attribute (Requirements 3.1, 3.4).
- * - A standard (not FIFO) SQS queue with a redrive policy to a dead-letter
- *   queue, so events for different customers can be processed concurrently by
- *   the agent (Requirement 19.5) and failed events land in the DLQ after the
- *   retry budget is exhausted (Requirement 15.2).
+ * - A FIFO SQS queue (message group = `customerId`) with a redrive policy to a
+ *   FIFO dead-letter queue. Grouping by customer serializes one customer's
+ *   events — which the agent's per-customer session lock requires — while
+ *   different customers still process concurrently (Requirement 19.5), and
+ *   failed events land in the DLQ after the retry budget is exhausted
+ *   (Requirement 15.2).
  * - A CloudWatch alarm on the DLQ depth so operators are notified when messages
  *   accumulate (Requirement 18.2).
  *
@@ -75,15 +77,40 @@ export class WebhookReceiverStack extends cdk.Stack {
     const dataApiUrl = `https://api.${domainName}`;
 
     // --- SQS: dead-letter queue + main event queue --------------------------
-    // Standard (not FIFO) queues so events for different customers process
-    // concurrently (Requirement 19.5). Failed events move to the DLQ after
-    // maxReceiveCount delivery attempts (Requirement 15.2: up to 3 attempts).
+    // FIFO queues. Each delivery is enqueued under `MessageGroupId =
+    // customerId` (see the handler), which makes SQS serialize a single
+    // customer's events while still processing different customers concurrently
+    // — Lambda caps FIFO concurrency at the number of active message groups, so
+    // cross-customer parallelism is preserved (Requirement 19.5). That
+    // serialization is what the agent's per-customer session lock needs: with a
+    // standard queue, two events for the same customer are delivered
+    // concurrently, race for the lock, and the loser fails its receive.
+    //
+    // A FIFO queue's dead-letter queue must also be FIFO. Failed events move to
+    // the DLQ after maxReceiveCount delivery attempts (Requirement 15.2: up to
+    // 3 attempts).
+    //
+    // NOTE (FIFO ordering tradeoff): while a message is being retried it blocks
+    // its own message group, so a repeatedly-failing event delays that one
+    // customer's later events until it dead-letters. That is the intended
+    // behaviour for an ordered accumulator, and it is bounded by
+    // maxReceiveCount x visibilityTimeout.
     const deadLetterQueue = new sqs.Queue(this, "EventDeadLetterQueue", {
+      // Explicit name: a FIFO queue name must end in `.fifo`, so name both
+      // queues deterministically rather than relying on generated names.
+      queueName: "earthquake-agent-events-dlq.fifo",
+      fifo: true,
       enforceSSL: true,
       retentionPeriod: cdk.Duration.days(14),
     });
 
     const eventQueue = new sqs.Queue(this, "EventQueue", {
+      queueName: "earthquake-agent-events.fifo",
+      fifo: true,
+      // The handler supplies an explicit MessageDeduplicationId (the event id)
+      // when the payload carries one; content-based deduplication is the
+      // fallback for a payload without a usable id.
+      contentBasedDeduplication: true,
       enforceSSL: true,
       // The agent invokes the LLM per message, so give consumers ample time
       // before a message becomes visible again for retry.

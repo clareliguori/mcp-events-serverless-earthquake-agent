@@ -313,6 +313,44 @@ describe("refreshExpiringSubscriptions", () => {
     expect(upserts[0].secret).toBe(EXISTING_SECRET);
   });
 
+  it("re-derives the schedule from config, discarding a legacy value", async () => {
+    // Regression: a record written before the cron -> interval migration still
+    // carries a STRING `schedule`. Carrying it forward verbatim made the Data
+    // API reject the write with a 400 on every refresh, and because the upsert
+    // only falls back to creating on a 404, the subscription could never be
+    // re-registered — so the Webhook Receiver 401'd every delivery.
+    const legacy = makeSchedulerSub({
+      schedule: "0 */8 * * *" as unknown as number,
+    });
+    const customer: ActiveCustomer = {
+      config: makeConfig({ briefingSchedule: 4 }),
+      subscriptions: [legacy],
+    };
+    const { deps, upserts } = makeFakeDeps([customer]);
+
+    const summary = await refreshExpiringSubscriptions({ now: NOW }, deps);
+
+    expect(summary.refreshed).toBe(1);
+    expect(summary.failed).toBe(0);
+    expect(upserts[0].schedule).toBe(4);
+    // The USGS-only field is cleared so a record never carries both.
+    expect(upserts[0].filterParams).toBeUndefined();
+  });
+
+  it("re-derives filterParams from config on a USGS refresh", async () => {
+    const customer: ActiveCustomer = {
+      config: makeConfig({ subscriptionParams: { minMagnitude: 6 } }),
+      // A stray `schedule` on a USGS record must not survive the refresh.
+      subscriptions: [makeUsgsSub({ schedule: 24 })],
+    };
+    const { deps, upserts } = makeFakeDeps([customer]);
+
+    await refreshExpiringSubscriptions({ now: NOW }, deps);
+
+    expect(upserts[0].filterParams).toEqual({ minMagnitude: 6 });
+    expect(upserts[0].schedule).toBeUndefined();
+  });
+
   it("rotates the per-subscription secret when requested", async () => {
     const customer: ActiveCustomer = {
       config: makeConfig(),

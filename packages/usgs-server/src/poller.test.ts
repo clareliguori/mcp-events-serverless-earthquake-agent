@@ -23,13 +23,14 @@ import {
 import type { UsgsCursorState } from "@mcp-events/shared";
 import { USGS_CURSOR_MAX_IDS } from "@mcp-events/shared";
 import { mockClient } from "aws-sdk-client-mock";
-import { afterAll, afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   type FetchLike,
   type UsgsFeature,
   type UsgsFeatureCollection,
   DEFAULT_CURSOR_ID,
+  FEED_RETRY_DELAYS_MS,
   commitCursor,
   detectNewEarthquakes,
   extractEarthquakes,
@@ -39,6 +40,7 @@ import {
   mergeLastSeenIds,
   readCursorState,
   setDocumentClientForTesting,
+  setFeedRetrySleepForTesting,
 } from "./poller.js";
 
 const TABLE_NAME = "test-cursor-state";
@@ -119,6 +121,19 @@ afterAll(() => {
 });
 
 describe("fetchUsgsFeed", () => {
+  let warnSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    // Never wait on real backoff timers in unit tests.
+    setFeedRetrySleepForTesting(async () => undefined);
+    warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+  });
+
+  afterEach(() => {
+    setFeedRetrySleepForTesting(undefined);
+    warnSpy.mockRestore();
+  });
+
   it("returns the parsed feed JSON on a 2xx response", async () => {
     const feed: UsgsFeatureCollection = { features: [makeFeature()] };
     const feed_ = await fetchUsgsFeed(
@@ -138,6 +153,69 @@ describe("fetchUsgsFeed", () => {
     await expect(
       fetchUsgsFeed("https://example.test/feed", failing),
     ).rejects.toThrow(/503/);
+  });
+
+  it("retries a transient network rejection and succeeds", async () => {
+    const feed: UsgsFeatureCollection = { features: [makeFeature()] };
+    let calls = 0;
+    const flaky: FetchLike = () => {
+      calls += 1;
+      if (calls === 1) {
+        // What the live failure looked like: undici rejecting the request.
+        return Promise.reject(new TypeError("fetch failed"));
+      }
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () => Promise.resolve(feed),
+      });
+    };
+
+    const result = await fetchUsgsFeed("https://example.test/feed", flaky);
+
+    expect(result).toEqual(feed);
+    expect(calls).toBe(2);
+    // The recovered blip still logs a WARN, which the log-error metric filter
+    // counts — the retry must not make a transient failure invisible.
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("retries a retryable status then throws after the last attempt", async () => {
+    let calls = 0;
+    const failing: FetchLike = () => {
+      calls += 1;
+      return Promise.resolve({
+        ok: false,
+        status: 503,
+        json: () => Promise.resolve({}),
+      });
+    };
+
+    await expect(
+      fetchUsgsFeed("https://example.test/feed", failing),
+    ).rejects.toThrow(/503/);
+
+    expect(calls).toBe(FEED_RETRY_DELAYS_MS.length + 1);
+  });
+
+  it("does not retry a non-retryable client status", async () => {
+    // A 404 means the feed URL is wrong; retrying only delays surfacing it.
+    let calls = 0;
+    const notFound: FetchLike = () => {
+      calls += 1;
+      return Promise.resolve({
+        ok: false,
+        status: 404,
+        json: () => Promise.resolve({}),
+      });
+    };
+
+    await expect(
+      fetchUsgsFeed("https://example.test/feed", notFound),
+    ).rejects.toThrow(/404/);
+
+    expect(calls).toBe(1);
+    expect(warnSpy).not.toHaveBeenCalled();
   });
 
   it("defaults the feed URL to the USGS_FEED_URL env var", async () => {

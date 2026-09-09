@@ -20,6 +20,15 @@
  *    customer (Requirement 3.4), and returns 200 quickly (Requirements 3.5,
  *    19.2: validate + enqueue within 100 ms).
  *
+ * The event queue is **FIFO**, and each delivery is enqueued under
+ * `MessageGroupId = customerId`. SQS then serializes all events for a single
+ * customer while still letting different customers proceed concurrently, which
+ * is what the agent's per-customer session lock requires — two concurrently
+ * delivered events for the same customer would otherwise race for that lock and
+ * one would fail. `MessageDeduplicationId` is the emitting event's `eventId`, so
+ * a delivery the MCP server retries (for example after a lost response) is
+ * enqueued only once within the deduplication window.
+ *
  * HTTP status mapping (Requirements 3.2, 3.3, 3.4, 3.5). The verification
  * outcomes from {@link verifyWebhook} are split between client-error (400) and
  * unauthorized (401) deliberately:
@@ -29,7 +38,7 @@
  * - non-numeric `webhook-timestamp`          -> 400 (malformed request)
  * - timestamp outside the tolerance window   -> 401 (replayed/expired, discard)
  * - invalid / mismatched signature           -> 401 (inauthentic, discard)
- * - empty/unusable secret for the subscription -> 401 (cannot authenticate)
+ * - empty/unusable secret or customerId for the subscription -> 401 (cannot authenticate)
  * - subscription id not found by the Data API  -> 401 (cannot authenticate)
  * - valid signature                          -> 200 (enqueued)
  *
@@ -52,6 +61,13 @@ import { getSubscriptionId, verifyWebhook } from "./signature.js";
 
 /** Message attribute name carrying the subscription id on the SQS message. */
 export const SUBSCRIPTION_ID_ATTRIBUTE = "subscriptionId";
+
+/**
+ * Maximum length SQS allows for `MessageDeduplicationId` (and `MessageGroupId`).
+ * An id longer than this would make `SendMessage` fail, so an oversized event id
+ * is ignored in favour of the queue's content-based deduplication.
+ */
+const MAX_DEDUPLICATION_ID_LENGTH = 128;
 
 /**
  * The outcome of a Data API subscription lookup: the downstream HTTP status and
@@ -187,11 +203,21 @@ function readRawBody(event: APIGatewayProxyEvent): string {
 }
 
 /**
- * Extract the plaintext `secret` (`whsec_`) from a Data API
- * `GET /subscriptions/{id}` response body. Returns `undefined` when the body is
- * absent, not JSON, or has no string `secret` field.
+ * The fields this handler needs from a Data API
+ * `GET /subscriptions/{id}` response: the plaintext `whsec_` used to verify the
+ * signature, and the `customerId` used as the SQS FIFO `MessageGroupId`.
  */
-function extractSecret(body: string): string | undefined {
+interface ResolvedSubscription {
+  secret: string;
+  customerId: string;
+}
+
+/**
+ * Extract the plaintext `secret` (`whsec_`) and the owning `customerId` from a
+ * Data API `GET /subscriptions/{id}` response body. Returns `undefined` when the
+ * body is absent, not JSON, or is missing either field.
+ */
+function extractSubscription(body: string): ResolvedSubscription | undefined {
   if (body.length === 0) {
     return undefined;
   }
@@ -201,15 +227,48 @@ function extractSecret(body: string): string | undefined {
   } catch {
     return undefined;
   }
-  if (
-    typeof parsed === "object" &&
-    parsed !== null &&
-    "secret" in parsed &&
-    typeof (parsed as { secret?: unknown }).secret === "string"
-  ) {
-    return (parsed as { secret: string }).secret;
+  if (typeof parsed !== "object" || parsed === null) {
+    return undefined;
   }
-  return undefined;
+  const { secret, customerId } = parsed as {
+    secret?: unknown;
+    customerId?: unknown;
+  };
+  if (typeof secret !== "string" || typeof customerId !== "string") {
+    return undefined;
+  }
+  if (secret.length === 0 || customerId.length === 0) {
+    return undefined;
+  }
+  return { secret, customerId };
+}
+
+/**
+ * Pull the emitting event's id out of the raw delivery body for use as the SQS
+ * FIFO `MessageDeduplicationId`, so a webhook the MCP server re-delivers (for
+ * example after a lost response) is enqueued only once inside the 5-minute
+ * deduplication window. Returns `undefined` when the body carries no usable id,
+ * in which case the queue's content-based deduplication applies instead.
+ */
+function extractEventId(payload: string): string | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(payload);
+  } catch {
+    return undefined;
+  }
+  if (typeof parsed !== "object" || parsed === null) {
+    return undefined;
+  }
+  const { eventId } = parsed as { eventId?: unknown };
+  if (
+    typeof eventId !== "string" ||
+    eventId.length === 0 ||
+    eventId.length > MAX_DEDUPLICATION_ID_LENGTH
+  ) {
+    return undefined;
+  }
+  return eventId;
 }
 
 /**
@@ -234,29 +293,33 @@ export async function handler(
 
     const payload = readRawBody(event);
 
-    // 2. Resolve the per-subscription secret via the Data API (plaintext
-    //    whsec_; the receiver performs no KMS operations — Requirement 17.9).
-    const resolved = await lookup(subscriptionId);
-    if (resolved.statusCode === 404) {
+    // 2. Resolve the per-subscription secret and owning customer via the Data
+    //    API (plaintext whsec_; the receiver performs no KMS operations —
+    //    Requirement 17.9).
+    const lookupResult = await lookup(subscriptionId);
+    if (lookupResult.statusCode === 404) {
       // Unknown subscription id: the delivery cannot be authenticated, so it is
       // discarded like a bad signature (Requirement 3.2).
       console.warn("Unknown subscription for delivery", { subscriptionId });
       return jsonResponse(401, { error: "Unknown subscription" });
     }
-    if (resolved.statusCode < 200 || resolved.statusCode >= 300) {
+    if (lookupResult.statusCode < 200 || lookupResult.statusCode >= 300) {
       // Transient/upstream failure — do NOT 200 (nothing was enqueued). A 5xx
       // lets the MCP server retry rather than lose the event.
       throw new Error(
-        `Data API subscription lookup returned ${resolved.statusCode}`,
+        `Data API subscription lookup returned ${lookupResult.statusCode}`,
       );
     }
 
-    const secret = extractSecret(resolved.body);
-    if (secret === undefined) {
-      // The subscription exists but carries no usable secret — cannot verify.
+    const resolved = extractSubscription(lookupResult.body);
+    if (resolved === undefined) {
+      // The subscription exists but carries no usable secret / customerId — the
+      // delivery cannot be verified, and without a customerId there is no
+      // correct FIFO message group to enqueue it under.
       console.warn("Subscription has no usable secret", { subscriptionId });
       return jsonResponse(401, { error: "Subscription secret unavailable" });
     }
+    const { secret, customerId } = resolved;
 
     // 3. Verify the Standard Webhooks signature against the per-subscription
     //    secret (Requirements 3.1, 3.2, 3.3).
@@ -285,10 +348,24 @@ export async function handler(
 
     // 4. Enqueue the validated event with the subscriptionId attribute so the
     //    agent can resolve it to a customer (Requirement 3.4).
+    //
+    //    The queue is FIFO and `MessageGroupId` is the `customerId`, so SQS
+    //    serializes every event for one customer while still processing
+    //    different customers concurrently (Requirement 19.5 — Lambda caps FIFO
+    //    concurrency at the number of active message groups). That is what the
+    //    agent's session lock needs: without it, two events for the same
+    //    customer are delivered concurrently and one loses the lock race.
+    //    `MessageDeduplicationId` is the emitting event's id, so a delivery the
+    //    MCP server retries after a lost response is enqueued only once.
+    const eventId = extractEventId(payload);
     await getSqsClient().send(
       new SendMessageCommand({
         QueueUrl: eventQueueUrl(),
         MessageBody: payload,
+        MessageGroupId: customerId,
+        ...(eventId !== undefined
+          ? { MessageDeduplicationId: eventId }
+          : {}),
         MessageAttributes: {
           [SUBSCRIPTION_ID_ATTRIBUTE]: {
             DataType: "String",

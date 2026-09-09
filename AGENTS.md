@@ -326,10 +326,105 @@ it runs as part of `npm test`.
   `S3Storage` (imported from `@strands-agents/sdk/session/s3-storage`) at
   `sessions/{customerId}/scopes/agent/agent/snapshots/...`.
 - **Session writes are serialized** with `@deliveryhero/dynamodb-lock`
-  (`agent/src/lock.ts`, 60s TTL, 10s acquire timeout). Always go through
-  `withLock(customerId, fn)`.
+  (`agent/src/lock.ts`). Always go through `withLock(customerId, fn)`.
+
+  Two lock settings are load-bearing and easy to break:
+
+  1. **`trustLocalTime: true` + an explicit `waitDurationInMs`** are what make a
+     contended waiter actually poll. The library only honours a caller-set wait
+     interval on the `trustLocalTime` path; with both unset its contended path
+     sleeps for the whole `leaseDurationInMs` before re-checking, so a waiter got
+     one attempt and then slept past the acquisition timeout — every contended
+     acquisition failed no matter how fast the holder released. That produced 109
+     lock timeouts across 81 messages in one week, 7 of which exhausted
+     `maxReceiveCount` and dead-lettered.
+  2. **`LOCK_TTL_MS` must stay >= the agent Lambda's timeout** (300s). Because
+     `prolongLeaseEnabled` is false the lease is fixed at acquisition and a live
+     holder never refreshes it, so a shorter lease would expire mid-work and let a
+     waiter steal the lock from a still-working holder — two concurrent writers to
+     one session. `lock.test.ts` asserts this invariant; if you change the Lambda
+     timeout, change the lease with it.
+
+  Note these numbers diverge from Requirements 6.3/6.4, which specify a 60s lease
+  and a 10s acquisition timeout. Both were unsafe in combination with the library's
+  actual behaviour; the code is the source of truth.
+- **The event queue is SQS FIFO, grouped by customer.** The Webhook Receiver
+  enqueues every delivery with `MessageGroupId = customerId` (and
+  `MessageDeduplicationId = eventId`), which is what actually serializes a
+  customer's events; Lambda caps FIFO concurrency at the number of active
+  message groups, so different customers still process in parallel. **Preserve
+  this invariant** — anything that enqueues to this queue must group by
+  `customerId`, and the receiver returns 401 rather than guessing a group when
+  the Data API lookup yields no `customerId`.
+
+  FIFO grouping and the lock are deliberately belt-and-suspenders: FIFO means the
+  lock should never be contended in normal operation, and the lock still protects
+  the cases FIFO does not cover (a redriven message racing a live one, a future
+  non-queue caller).
+
+  FIFO tradeoff to know: a failing message blocks its own message group until it
+  succeeds or dead-letters, so one poison event delays that customer's later
+  events for up to `maxReceiveCount` x `visibilityTimeout`.
 - **Idempotency** is enforced via a bounded `processedEventIds` window in the
   session metadata (`agent/src/accumulate.ts`), not just `lastEventId`.
+- **The accumulator can degenerate if briefings stop.** The conversation history
+  *is* the accumulator, and it is only cleared when a briefing succeeds. If
+  briefings stall, the conversation grows unbounded (bounded only by
+  `SlidingWindowConversationManager`) and the model can fall into a
+  self-reinforcing refusal loop — every new earthquake turn conditions on the
+  previous refusal and repeats it, so `save_report` is never called and
+  `processBriefingEvent` throws `did not produce a saved report` forever.
+  `recovery.ts` does **not** catch this: it only classifies *structurally*
+  unloadable snapshots (bad JSON, wrong `scope`/`schemaVersion`) as corrupt, and
+  a degenerate conversation is structurally valid. Recovery is manual — archive
+  the snapshot aside (the `recoverCorruptedSession` convention) and let the next
+  event start fresh:
+
+  ```bash
+  B=<sessions bucket>; K=sessions/<customerId>/scopes/agent/agent/snapshots/snapshot_latest.json
+  aws s3api copy-object --bucket "$B" --key "$K-degenerate-$(date -u +%Y-%m-%dT%H-%M-%S-000Z)" \
+    --copy-source "$(python3 -c 'import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))' "$B/$K")" --no-cli-pager
+  aws s3api delete-object --bucket "$B" --key "$K" --no-cli-pager
+  ```
+
+  The first briefing after a reset skips with `no-activity` (empty
+  conversation); reports resume once events accumulate again. When diagnosing a
+  briefing that delivers but produces no report, read the tail of
+  `snapshot_latest.json` (`data.messages`) before anything else — the model's
+  own replies show the degeneration directly.
+- **Subscription records must not carry legacy-shaped fields forward.** A
+  refresh re-derives `filterParams`/`schedule` from the customer's current
+  config (`refresh.ts` `domainFieldsFor`) rather than copying them off the
+  stored record. Copying them meant a record written under an older schema (a
+  cron-string `schedule` from before the interval migration) failed Data API
+  validation with a 400 on every refresh; since `upsertSubscriptionRecord` only
+  falls back to POST-create on a **404**, the refresh wedged permanently and the
+  Webhook Receiver 401'd every delivery for the id the MCP server was actually
+  using. Schema changes to `webhookSubscriptionSchema` need a migration or a
+  deliberate heal path for existing rows.
+
+## Monitoring gotchas
+
+- **The log-error metric filters match `WARN` as well as `ERROR`**
+  (`addLogErrorAlarm` uses `FilterPattern.anyTerm("ERROR", "WARN")`), and each
+  alarm fires at `Sum >= 1` over a single 5-minute period. So *any* single
+  `console.warn` pages. Keep that in mind when adding a warn-level log on a
+  routine path — and conversely, it is what lets `fetchUsgsFeed` log a WARN per
+  retry and stay visible to the alarm even when the retry succeeds.
+- **`earthquake-agent-system-health` is a composite `anyOf` over every child
+  alarm.** One chronically-failing child pins it in ALARM indefinitely, and
+  because it never returns to OK it never re-notifies — so a single persistent
+  failure silently masks every other alarm in the system. During the three-month
+  briefing outage `subscription-manager-log-errors` was recording **288
+  errors/day** (one per 5-minute refresh) and `agent-log-errors` 15-37/day from
+  lock timeouts. Detection and notification (SNS -> AWS Chatbot) were both
+  working; the signal was simply drowned. When triaging, check the child alarms'
+  metrics directly rather than trusting the composite's current state.
+- `fetchUsgsFeed` retries transient failures ({@link FEED_RETRY_DELAYS_MS}) but
+  has **no per-attempt timeout**. A hung connection therefore has nothing to
+  abort it and will stall until the poller Lambda's 60s timeout instead of
+  failing fast into a retry. Adding `AbortSignal.timeout(...)` is the remaining
+  gap there.
 
 ## Where the code diverges from the spec
 

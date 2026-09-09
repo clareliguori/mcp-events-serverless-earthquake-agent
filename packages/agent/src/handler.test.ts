@@ -68,6 +68,7 @@ import {
   type ConfigLookupResult,
 } from "./config.js";
 import {
+  LOCK_ACQUISITION_TIMEOUT_MS,
   LOCK_GROUP,
   setLockClientForTesting,
   type SessionLockClient,
@@ -597,7 +598,7 @@ describe("handler — batch item failures (SQS retry)", () => {
     setSubscriptionLookupForTesting(lookupReturningCustomer(CUSTOMER_ID));
     setConfigLookupForTesting(configReturning(makeConfig()));
     s3Mock.on(GetObjectCommand, { Key: sessionKey() }).rejects(noSuchKey());
-    // Lock never grants -> withLock's 10s acquisition timer fires.
+    // Lock never grants -> withLock's acquisition timer fires.
     setLockClientForTesting(new FakeLockClient("hang"));
 
     const promise = handler(
@@ -612,8 +613,9 @@ describe("handler — batch item failures (SQS retry)", () => {
       () => undefined,
     );
 
-    // Advance past the 10s lock acquisition timeout.
-    await vi.advanceTimersByTimeAsync(10_000);
+    // Advance past the lock acquisition timeout (read from the constant so
+    // this cannot drift if the budget is retuned).
+    await vi.advanceTimersByTimeAsync(LOCK_ACQUISITION_TIMEOUT_MS);
     const response = await promise;
 
     expect(response).toEqual({

@@ -16,20 +16,41 @@
  * library directly.
  *
  * Lock semantics mapped onto the library options (Requirements 6.3, 6.4, 6.5):
- * - **TTL / lease (60s)** -> `leaseDurationInMs: 60_000` with
+ * - **Lease / TTL** -> `leaseDurationInMs: LOCK_TTL_MS` with
  *   `prolongLeaseEnabled: false`. A holder keeps the lock for at most the lease;
- *   if an invocation crashes the lock auto-releases once the lease elapses, and
- *   the table's `ttl` attribute lets DynamoDB sweep the abandoned row
- *   (Requirement 6.4). We intentionally do NOT prolong the lease: agent
- *   processing is well under a minute, and a fixed lease is the safety net.
- * - **Acquisition timeout (10s)** -> the library waits (potentially a full
- *   lease) to steal a contended lock, so we race acquisition against a 10s
- *   timer. On timeout {@link withLock} throws {@link LockAcquisitionTimeoutError}
- *   so the agent can let the SQS message return to the queue for retry
- *   (Requirement 6.3).
+ *   if an invocation crashes the lock becomes stealable once the lease elapses,
+ *   and the table's `ttl` attribute lets DynamoDB sweep the abandoned row
+ *   (Requirement 6.4). We intentionally do NOT prolong the lease: a fixed lease
+ *   is the safety net, and prolonging would need a background timer inside the
+ *   Lambda.
+ *
+ *   **Invariant: the lease MUST be at least the holder Lambda's timeout.** With
+ *   `prolongLeaseEnabled: false` the lease is fixed at acquisition and a live
+ *   holder never refreshes it, so a lease shorter than the maximum possible hold
+ *   would let a waiter treat a still-working holder as dead and steal the lock —
+ *   two concurrent writers to one session, the exact corruption this lock
+ *   exists to prevent. See {@link LOCK_TTL_MS}.
+ * - **Contended acquisition** -> `trustLocalTime: true` plus an explicit
+ *   {@link LOCK_WAIT_INTERVAL_MS} makes the library poll for the lock. This is
+ *   load-bearing: left unset, the library's contended path sleeps for the FULL
+ *   `leaseDurationInMs` before re-checking, which is far longer than the
+ *   acquisition timeout below — so a waiter got exactly one attempt and was then
+ *   guaranteed to time out, no matter how quickly the holder released. See
+ *   {@link LOCK_WAIT_INTERVAL_MS}.
+ * - **Acquisition timeout** -> acquisition is raced against a
+ *   {@link LOCK_ACQUISITION_TIMEOUT_MS} timer. On timeout {@link withLock} throws
+ *   {@link LockAcquisitionTimeoutError} so the agent can let the SQS message
+ *   return to the queue for retry (Requirement 6.3).
  * - **Owner-only release** -> handled by the library's conditional delete
  *   (only the record-version/owner that holds the lock can release it,
  *   Requirement 6.5).
+ *
+ * Note that in normal operation this lock should never be contended at all: the
+ * event queue is SQS FIFO with one message group per customer, so SQS already
+ * delivers a single customer's events one at a time. The lock is the backstop
+ * for the cases FIFO does not cover (a redriven message racing a live one, or a
+ * future non-queue caller) — which is exactly why its waiting behaviour has to
+ * actually work.
  *
  * Table schema: the lock client addresses rows by `customerId` (partition key)
  * plus a constant `lockGroup` sort key, and stores the lease deadline under the
@@ -44,11 +65,47 @@ import {
   type LockOptions,
 } from "@deliveryhero/dynamodb-lock";
 
-/** Lock lease / TTL in milliseconds (Requirement 6.4 — 60 seconds). */
-export const LOCK_TTL_MS = 60_000;
+/**
+ * Lock lease / TTL in milliseconds (Requirement 6.4).
+ *
+ * This MUST be >= the agent Lambda's configured timeout (300s in `AgentStack`).
+ * Because `prolongLeaseEnabled` is false the lease is fixed at acquisition, so a
+ * shorter lease would expire while a legitimate holder is still working — and a
+ * waiter, seeing an expired lease, would steal the lock and write the same
+ * session concurrently. A holder cannot outlive the Lambda timeout, so pinning
+ * the lease to it guarantees an expired lease means a dead holder.
+ *
+ * The cost of the longer lease is slower recovery from a crashed holder: the
+ * lock stays unavailable for up to this long. That is bounded and acceptable —
+ * SQS redelivers on a 300s visibility timeout, so a retry arrives about when the
+ * lease frees up, and FIFO grouping means only the affected customer waits.
+ */
+export const LOCK_TTL_MS = 300_000;
 
-/** Max time to wait to acquire a contended lock (Requirement 6.3 — 10 seconds). */
-export const LOCK_ACQUISITION_TIMEOUT_MS = 10_000;
+/**
+ * How long to wait between attempts when the lock is already held.
+ *
+ * This is the fix for a subtle failure: the library only honours a caller-set
+ * wait interval when `trustLocalTime` is true. With both left unset, its
+ * contended path sleeps for the whole `leaseDurationInMs` before looking again,
+ * so a waiter made a single attempt and then slept far past
+ * {@link LOCK_ACQUISITION_TIMEOUT_MS} — every contended acquisition failed even
+ * though holders release in a few seconds. Polling at this interval instead lets
+ * a waiter pick the lock up as soon as the holder releases.
+ */
+export const LOCK_WAIT_INTERVAL_MS = 500;
+
+/**
+ * Max time to wait to acquire a contended lock (Requirement 6.3).
+ *
+ * Sized to outlast a typical holder rather than a worst-case one: accumulate
+ * invocations hold the lock for roughly 4-9s, so 30s absorbs a predecessor (or
+ * two) comfortably. A briefing holder can run far longer (its Bedrock invoke
+ * alone is allowed 90s), and in that case timing out is the right outcome — the
+ * SQS message returns to the queue and is retried later instead of burning
+ * Lambda time blocked on a lock.
+ */
+export const LOCK_ACQUISITION_TIMEOUT_MS = 30_000;
 
 /**
  * Sort-key value used for every session lock row. The agent only ever locks on
@@ -160,6 +217,13 @@ async function acquireWithTimeout(customerId: string): Promise<Lock> {
   const acquisition = client.lock(LOCK_GROUP, customerId, {
     leaseDurationInMs: LOCK_TTL_MS,
     prolongLeaseEnabled: false,
+    // Poll for a contended lock instead of sleeping a whole lease duration.
+    // `waitDurationInMs` is only honoured on the `trustLocalTime` path, so both
+    // are required together — see LOCK_WAIT_INTERVAL_MS. `trustLocalTime` is
+    // safe here because LOCK_TTL_MS >= the holder Lambda's timeout, so an
+    // expired lease always means the holder is gone rather than still working.
+    trustLocalTime: true,
+    waitDurationInMs: LOCK_WAIT_INTERVAL_MS,
   });
 
   try {

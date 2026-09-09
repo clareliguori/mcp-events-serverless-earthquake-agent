@@ -18,6 +18,7 @@ import {
   LOCK_ACQUISITION_TIMEOUT_MS,
   LOCK_GROUP,
   LOCK_TTL_MS,
+  LOCK_WAIT_INTERVAL_MS,
   LockAcquisitionTimeoutError,
   type SessionLockClient,
   setLockClientForTesting,
@@ -32,7 +33,12 @@ function fakeLock(lockId: string): unknown {
 interface LockCall {
   lockGroup: string;
   lockId: string;
-  options?: { leaseDurationInMs?: number; prolongLeaseEnabled?: boolean };
+  options?: {
+    leaseDurationInMs?: number;
+    prolongLeaseEnabled?: boolean;
+    trustLocalTime?: boolean;
+    waitDurationInMs?: number;
+  };
 }
 
 /**
@@ -103,7 +109,7 @@ describe("withLock", () => {
     expect(releaseCalls).toHaveLength(1);
   });
 
-  it("configures the 60s lease and disables lease prolonging", async () => {
+  it("configures the lease, disables prolonging, and polls while contended", async () => {
     const { client, lockCalls } = makeFakeClient();
     setLockClientForTesting(client);
 
@@ -112,8 +118,27 @@ describe("withLock", () => {
     expect(lockCalls[0].options).toMatchObject({
       leaseDurationInMs: LOCK_TTL_MS,
       prolongLeaseEnabled: false,
+      // Both are required together: the library only honours waitDurationInMs on
+      // the trustLocalTime path, and without them a contended waiter sleeps a
+      // whole lease duration and can never acquire within the timeout.
+      trustLocalTime: true,
+      waitDurationInMs: LOCK_WAIT_INTERVAL_MS,
     });
-    expect(LOCK_TTL_MS).toBe(60_000);
+  });
+
+  it("keeps the lease at least as long as the agent Lambda timeout", () => {
+    // Invariant: with prolongLeaseEnabled false the lease is fixed at
+    // acquisition, so it must outlast the longest possible hold. A holder cannot
+    // outlive the Lambda timeout (300s in AgentStack), so a lease below that
+    // would let a waiter steal the lock from a still-working holder and corrupt
+    // the session. Keep this in sync if the Lambda timeout changes.
+    const AGENT_LAMBDA_TIMEOUT_MS = 300_000;
+    expect(LOCK_TTL_MS).toBeGreaterThanOrEqual(AGENT_LAMBDA_TIMEOUT_MS);
+    // The poll interval must also be well under the acquisition budget,
+    // otherwise a waiter still gets only one attempt.
+    expect(LOCK_WAIT_INTERVAL_MS).toBeLessThan(
+      LOCK_ACQUISITION_TIMEOUT_MS / 2,
+    );
   });
 
   it("releases the lock even when fn throws, and propagates the error", async () => {
@@ -139,7 +164,7 @@ describe("withLock", () => {
     expect(value).toEqual({ count: 42 });
   });
 
-  it("throws LockAcquisitionTimeoutError when acquisition exceeds 10s", async () => {
+  it("throws LockAcquisitionTimeoutError when acquisition exceeds the timeout", async () => {
     // Acquisition never resolves within the timeout window.
     const { client, releaseCalls } = makeFakeClient({
       acquire: () => new Promise<unknown>(() => undefined),

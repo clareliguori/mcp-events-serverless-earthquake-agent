@@ -149,10 +149,23 @@ export class AgentStack extends cdk.Stack {
     // size 1 ensures one event per Lambda invocation (Requirement 19.4); report
     // batch item failures so a failed message returns to the queue and
     // eventually the DLQ (Requirement 15.2).
+    //
+    // The queue is FIFO with `MessageGroupId = customerId`, so Lambda delivers a
+    // single customer's events strictly one at a time — the agent's per-customer
+    // session lock is therefore uncontended in normal operation and acts as a
+    // backstop rather than the primary serialization mechanism.
+    //
+    // maxConcurrency is NOT what serializes a customer (it cannot be: the API's
+    // minimum is 2, which is exactly what used to let two invocations race for
+    // one customer's lock). Its only job is bounding total fan-out. For FIFO,
+    // effective concurrency is the lower of this value and the number of active
+    // message groups, so per customer the binding constraint is always FIFO's
+    // one-per-group; this ceiling only caps how many DIFFERENT customers process
+    // at once (Requirement 19.5).
     handlerFn.addEventSource(
       new SqsEventSource(eventQueue, {
         batchSize: 1,
-        maxConcurrency: 2,
+        maxConcurrency: 500,
         reportBatchItemFailures: true,
       }),
     );
