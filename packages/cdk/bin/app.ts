@@ -9,6 +9,7 @@ import { MonitoringStack } from "../lib/monitoring-stack.js";
 import { SchedulerServerStack } from "../lib/scheduler-server-stack.js";
 import { SubscriptionManagerStack } from "../lib/subscription-manager-stack.js";
 import { UsgsServerStack } from "../lib/usgs-server-stack.js";
+import { WebappAuthEdgeStack } from "../lib/webapp-auth-edge-stack.js";
 import { WebappStack } from "../lib/webapp-stack.js";
 import { WebhookReceiverStack } from "../lib/webhook-receiver-stack.js";
 import {
@@ -143,17 +144,31 @@ const subscriptionManager = new SubscriptionManagerStack(
   },
 );
 
+// WebappAuthEdgeStack (the CloudFront viewer-request Cognito auth gate) is
+// pinned to us-east-1 like DnsUsEast1Stack, because Lambda@Edge functions must
+// live there. It needs the APP region as a concrete string — the region of the
+// SSM parameter AuthStack publishes its Cognito config into — because
+// Lambda@Edge supports no environment variables and the value has to be baked
+// into the function bundle at synth time.
+const webappAuthEdge = new WebappAuthEdgeStack(app, "WebappAuthEdgeStack", {
+  env: usEast1Env,
+  appRegion: env.region ?? "",
+  crossRegionReferences: true,
+});
+
 // WebappStack (S3 SPA bucket fronted by a CloudFront distribution at
 // app.earthquake-agent.<parentDomain> using Origin Access Control, with a
 // security response headers policy) imports the subdomain zone id from
 // DnsRegionalStack via Fn.importValue (same region) and consumes the us-east-1
 // certificate from DnsUsEast1Stack across regions (construct reference +
 // crossRegionReferences). CloudFront requires its certificate in us-east-1,
-// which that certificate satisfies.
+// which that certificate satisfies. The Lambda@Edge auth gate version comes
+// across regions the same way, for the same reason.
 const webapp = new WebappStack(app, "WebappStack", {
   ...shared,
   env,
   usEast1Certificate: dnsUsEast1.certificate,
+  authGateFunctionVersion: webappAuthEdge.functionVersion,
   crossRegionReferences: true,
 });
 
@@ -171,6 +186,11 @@ usgsServer.addDependency(dnsRegional); // cert ARN + subdomain zone id
 schedulerServer.addDependency(dnsRegional); // cert ARN + subdomain zone id
 webhookReceiver.addDependency(dnsRegional); // cert ARN + subdomain zone id
 webapp.addDependency(dnsRegional); // EarthquakeAgent-SubdomainZoneId
+// The auth gate reads AuthStack's edge-config SSM parameter at RUNTIME rather
+// than importing it, so nothing in CloudFormation orders these two. Declare it
+// explicitly: if the gate went live before the parameter existed, every request
+// to the site would fail closed with a 500.
+webappAuthEdge.addDependency(auth); // /earthquake-agent/auth/edge-config
 agent.addDependency(webhookReceiver); // EarthquakeAgent-WebhookQueueArn
 dataApi.addDependency(dnsRegional); // cert ARN + subdomain zone id
 dataApi.addDependency(auth); // EarthquakeAgent-UserPoolId

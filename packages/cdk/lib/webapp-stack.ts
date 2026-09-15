@@ -3,6 +3,7 @@ import * as cdk from "aws-cdk-lib";
 import type * as acm from "aws-cdk-lib/aws-certificatemanager";
 import * as cloudfront from "aws-cdk-lib/aws-cloudfront";
 import * as origins from "aws-cdk-lib/aws-cloudfront-origins";
+import type * as lambda from "aws-cdk-lib/aws-lambda";
 import * as route53 from "aws-cdk-lib/aws-route53";
 import * as route53targets from "aws-cdk-lib/aws-route53-targets";
 import * as s3 from "aws-cdk-lib/aws-s3";
@@ -21,6 +22,17 @@ export interface WebappStackProps extends cdk.StackProps, SharedProps {
    * name (same region).
    */
   readonly usEast1Certificate: acm.ICertificate;
+
+  /**
+   * The published Lambda@Edge version from WebappAuthEdgeStack, attached to the
+   * default behavior as a VIEWER_REQUEST trigger so no request reaches the
+   * origin without a valid Cognito session.
+   *
+   * Like the certificate, this is a us-east-1 resource consumed by a stack in
+   * the target region, so it crosses regions as a construct reference (see
+   * {@link usEast1Certificate}).
+   */
+  readonly authGateFunctionVersion: lambda.IVersion;
 }
 
 /**
@@ -41,6 +53,23 @@ export interface WebappStackProps extends cdk.StackProps, SharedProps {
  * - A response headers policy applying sensible security headers (HSTS,
  *   X-Content-Type-Options, X-Frame-Options, Referrer-Policy).
  * - A Route53 alias record pointing the custom domain at the distribution.
+ *
+ * AUTH GATE (Requirement 17.4): the default behavior carries a VIEWER_REQUEST
+ * Lambda@Edge trigger (see WebappAuthEdgeStack) that requires a valid Cognito
+ * session before any request reaches the origin. Without it the SPA's own
+ * client-side login could only start AFTER the bundle had been served, leaving
+ * the landing page and every asset anonymously fetchable. Consequences worth
+ * knowing:
+ * - The SPA keeps its own in-memory PKCE flow untouched (Requirement 10.6).
+ * - Signing in is therefore TWO steps, verified against the deployed site: the
+ *   Hosted UI form (the gate), then the SPA's own "Sign in" button, which
+ *   completes silently with no second form because the viewer already holds a
+ *   Cognito session. The SPA does not auto-initiate its login
+ *   (`handleRedirectCallback` simply reports "unauthenticated" when no `code` is
+ *   present), so the landing page IS still shown to a gated viewer — it is not
+ *   dead code. Making that click disappear would take a webapp change.
+ * - The 403/404 -> `index.html` rewrites below are unaffected: they are origin
+ *   responses, and the gate does not re-run for them.
  *
  * OAC NOTE (Requirement 17.4): The S3 origin is created with
  * `origins.S3BucketOrigin.withOriginAccessControl(bucket)`, the current
@@ -134,6 +163,22 @@ export class WebappStack extends cdk.Stack {
         allowedMethods: cloudfront.AllowedMethods.ALLOW_GET_HEAD_OPTIONS,
         cachePolicy: cloudfront.CachePolicy.CACHING_OPTIMIZED,
         responseHeadersPolicy,
+        // Cognito auth gate (Requirement 17.4). VIEWER_REQUEST, not
+        // ORIGIN_REQUEST: an origin trigger is skipped on a cache hit, so a
+        // cached landing page would still be served anonymously. A viewer
+        // trigger runs on every request, ahead of the cache lookup.
+        //
+        // The session cookie is deliberately NOT part of the cache key
+        // (CACHING_OPTIMIZED strips cookies). That is correct here: these are
+        // static assets, identical for every signed-in viewer, and the
+        // authorization decision is made per request by the gate before the
+        // cache is consulted.
+        edgeLambdas: [
+          {
+            functionVersion: props.authGateFunctionVersion,
+            eventType: cloudfront.LambdaEdgeEventType.VIEWER_REQUEST,
+          },
+        ],
       },
       // SPA deep-link support: serve index.html (200) for client-routed paths
       // that S3 reports as 403/404.

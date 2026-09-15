@@ -6,8 +6,13 @@ import * as iam from "aws-cdk-lib/aws-iam";
 import * as route53 from "aws-cdk-lib/aws-route53";
 import * as route53targets from "aws-cdk-lib/aws-route53-targets";
 import * as secretsmanager from "aws-cdk-lib/aws-secretsmanager";
+import * as ssm from "aws-cdk-lib/aws-ssm";
 import { Construct } from "constructs";
-import { resolveDomainName, type SharedProps } from "./shared-props.js";
+import {
+  EDGE_AUTH_CONFIG_PARAMETER_NAME,
+  resolveDomainName,
+  type SharedProps,
+} from "./shared-props.js";
 
 export interface AuthStackProps extends cdk.StackProps, SharedProps {
   /**
@@ -97,7 +102,16 @@ export class AuthStack extends cdk.Stack {
           cognito.OAuthScope.EMAIL,
           cognito.OAuthScope.PROFILE,
         ],
-        callbackUrls: [appUrl, `${appUrl}/`, "http://localhost:5173/"],
+        callbackUrls: [
+          appUrl,
+          `${appUrl}/`,
+          // The CloudFront Lambda@Edge auth gate's own callback. The gate uses
+          // this same public PKCE client (see WebappAuthEdgeStack), so it needs
+          // its redirect URI registered here; the SPA's callbacks above are
+          // unchanged.
+          `${appUrl}/_auth/callback`,
+          "http://localhost:5173/",
+        ],
         logoutUrls: [appUrl, `${appUrl}/`, "http://localhost:5173/"],
       },
       preventUserExistenceErrors: true,
@@ -154,6 +168,32 @@ export class AuthStack extends cdk.Stack {
       description:
         "Cognito Hosted UI custom domain (auth.earthquake-agent.<parentDomain>)",
       exportName: "EarthquakeAgent-HostedUiDomain",
+    });
+
+    // --- Runtime config for the CloudFront edge auth gate --------------------
+    // The Lambda@Edge auth gate (WebappAuthEdgeStack) needs the User Pool id and
+    // app client id at runtime, but Lambda@Edge supports no environment
+    // variables and both values are CloudFormation tokens at synth time, so they
+    // can be neither injected as env vars nor baked into its bundle. Publish
+    // them here under a well-known literal parameter name that the gate reads
+    // once per cold start.
+    //
+    // A plain (unencrypted) String parameter is correct: every field here is
+    // already public to any browser that loads the SPA — the same values are
+    // written into the site's `config.json` by WebappStack. Nothing secret
+    // crosses this boundary.
+    new ssm.StringParameter(this, "EdgeAuthConfigParameter", {
+      parameterName: EDGE_AUTH_CONFIG_PARAMETER_NAME,
+      description:
+        "Non-secret Cognito configuration read by the webapp CloudFront Lambda@Edge auth gate",
+      // toJsonString (not JSON.stringify) so the unresolved token values above
+      // resolve correctly at deploy time.
+      stringValue: this.toJsonString({
+        userPoolId: userPool.userPoolId,
+        clientId: client.userPoolClientId,
+        hostedUiDomain: authDomainName,
+        appDomain: `app.${domainName}`,
+      }),
     });
 
     // --- Persistent test user (auto-synced password, no manual step) --------

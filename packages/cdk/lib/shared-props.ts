@@ -38,3 +38,18 @@ export const DEFAULT_SUBDOMAIN = "earthquake-agent";
 export function resolveDomainName(props: SharedProps): string {
   return `${props.subdomain}.${props.parentDomain}`;
 }
+
+
+/**
+ * Name of the SSM parameter (in the APP region) that carries the webapp edge
+ * auth gate's runtime configuration.
+ *
+ * `AuthStack` writes it and the Lambda@Edge auth gate reads it once per cold
+ * start. It exists because Lambda@Edge supports no environment variables and the
+ * values it holds (User Pool id, app client id) are CloudFormation tokens at
+ * synth time, so they can be delivered neither as env vars nor baked into the
+ * function's bundle. The NAME, unlike those values, is a literal both sides can
+ * agree on at synth time — hence this constant rather than a stack export.
+ */
+export const EDGE_AUTH_CONFIG_PARAMETER_NAME =
+  "/earthquake-agent/auth/edge-config";

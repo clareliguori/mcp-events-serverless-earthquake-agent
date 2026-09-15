@@ -95,6 +95,32 @@ SPA served via CloudFront. The webapp authenticates with Cognito and calls the
 Data API with a JWT to manage config, read reports, and view the agent's
 conversation history.
 
+The distribution is not anonymously reachable. A CloudFront viewer-request
+Lambda@Edge function gates every request — including the landing page and the JS
+bundle — on a valid Cognito session, redirecting to the Hosted UI when there
+isn't one. The SPA keeps its own in-memory PKCE flow for its Data API calls, so
+signing in is the Hosted UI form followed by the SPA's own "Sign in" button,
+which completes with no second password prompt.
+
+> **Note on the demo's access model.** A real public version of this app would be
+> open in two places where this sample is deliberately closed:
+>
+> - **The CloudFront distribution would be public**, serving the marketing landing
+>   page to anyone, with authentication starting only when a visitor signs in.
+>   Here the edge gate fronts the entire distribution instead, so the landing page
+>   never reaches an anonymous viewer. (The SPA still renders that page, but only
+>   after the gate has already let you through — or locally under `npm run dev`.)
+> - **You would be able to create an account from the website.** The Cognito user
+>   pool has self sign-up disabled, so the "Create account" button on the landing
+>   page cannot work; an administrator provisions users out of band instead (see
+>   [DEVELOPMENT.md](DEVELOPMENT.md)).
+>
+> Both restrictions exist because this is a demo of MCP Events rather than a
+> service accepting real customers: there is no reason to expose it to the
+> internet or to let strangers create sessions in it. Neither is a constraint of
+> the architecture — opening them up means removing the edge gate from
+> `WebappStack` and enabling `selfSignUpEnabled` in `AuthStack`.
+
 <img src="diagrams/4-webapp.png" alt="Customer webapp" width="600">
 
 ## Getting started

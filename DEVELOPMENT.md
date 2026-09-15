@@ -20,20 +20,22 @@ This is a TypeScript (ESM, NodeNext) monorepo managed with **npm workspaces**.
 
 ### CDK stacks (`packages/cdk/lib`)
 
-`bin/app.ts` instantiates ten stacks:
+`bin/app.ts` instantiates twelve stacks:
 
 | Stack                      | Region    | Responsibility                                                                                                    |
 | -------------------------- | --------- | ----------------------------------------------------------------------------------------------------------------- |
 | `DnsRegionalStack`         | target    | Subdomain hosted zone, NS delegation, regional wildcard ACM cert for the API Gateway custom domains.              |
 | `DnsUsEast1Stack`          | us-east-1 | Wildcard ACM cert for CloudFront and Cognito (which require us-east-1 certs).                                     |
-| `AuthStack`                | target    | Cognito User Pool + Hosted UI domain.                                                                             |
+| `AuthStack`                | target    | Cognito User Pool + Hosted UI domain, test user, edge-gate config SSM parameter.                                  |
 | `DataApiStack`             | target    | Data API (API GW + Lambda), CustomerConfig + Subscriptions DynamoDB tables, reports S3 bucket, per-table KMS key. |
 | `UsgsServerStack`          | target    | MCP Server 1 (IAM-auth API GW), cursor + subscriptions tables, KMS key, EventBridge poll (5 min).                 |
 | `SchedulerServerStack`     | target    | MCP Server 2 (IAM-auth API GW), subscriptions table, KMS key, EventBridge check (1 min).                          |
 | `WebhookReceiverStack`     | target    | Webhook API GW, SQS event queue + DLQ, DLQ-depth alarm.                                                           |
 | `AgentStack`               | target    | Agent Lambda (SQS trigger, batch size 1), sessions S3 bucket, DynamoDB locks table.                               |
 | `SubscriptionManagerStack` | target    | Subscription Manager Lambda (DynamoDB Stream + EventBridge triggers).                                             |
-| `WebappStack`              | target    | SPA S3 bucket + CloudFront (OAC) at `app.<subdomain>.<parentDomain>`.                                             |
+| `WebappAuthEdgeStack`      | us-east-1 | Viewer-request Lambda@Edge Cognito auth gate for the webapp (Lambda@Edge must live in us-east-1).                 |
+| `WebappStack`              | target    | SPA S3 bucket + CloudFront (OAC) at `app.<subdomain>.<parentDomain>`, with the auth gate attached.                |
+| `MonitoringStack`          | target    | Composite alarm aggregating every component alarm into one system-health signal.                                  |
 
 ## Prerequisites
 
@@ -154,7 +156,22 @@ npx cdk deploy --all -c parentDomain=example.com
 ```
 
 `CDK_DEFAULT_ACCOUNT` and `CDK_DEFAULT_REGION` (populated by the AWS CLI) select
-the account and target region; `DnsUsEast1Stack` is always pinned to us-east-1.
+the account and target region; `DnsUsEast1Stack` and `WebappAuthEdgeStack` are
+always pinned to us-east-1.
+
+`WebappAuthEdgeStack` must be a concrete region deploy — it bakes the app region
+into the Lambda@Edge bundle at synth time (Lambda@Edge supports no environment
+variables), so synth fails fast if `CDK_DEFAULT_REGION` is unset.
+
+Two Lambda@Edge facts to expect when deploying or tearing down the auth gate:
+
+- **Attaching or updating the gate replicates it to every edge location**, so
+  `WebappStack` takes several minutes longer than a normal CloudFront update.
+- **`cdk destroy` of `WebappAuthEdgeStack` fails until the replicas are gone.**
+  CloudFront removes them asynchronously after the distribution stops referencing
+  the function, and Lambda rejects the delete until it finishes ("Lambda was
+  unable to delete ... because it is a replicated function"). Destroy
+  `WebappStack` first, then wait — up to roughly an hour — and retry.
 
 To run the integration tests against a fresh deploy, capture the outputs:
 

@@ -10,6 +10,7 @@
     { "path": "./packages/webhook-receiver" },
     { "path": "./packages/agent" },
     { "path": "./packages/subscription-manager" },
+    { "path": "./packages/webapp-auth-edge" },
     { "path": "./packages/integration-tests" }
   ]
 }

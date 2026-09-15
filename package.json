@@ -16,6 +16,7 @@
     "packages/agent",
     "packages/subscription-manager",
     "packages/webapp",
+    "packages/webapp-auth-edge",
     "packages/integration-tests"
   ],
   "scripts": {

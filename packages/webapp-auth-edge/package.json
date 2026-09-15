@@ -1,0 +1,21 @@
+{
+  "name": "@mcp-events/webapp-auth-edge",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "Lambda@Edge viewer-request Cognito auth gate for the webapp CloudFront distribution",
+  "main": "dist/handler.js",
+  "scripts": {
+    "build": "tsc --build",
+    "clean": "tsc --build --clean"
+  },
+  "dependencies": {
+    "@aws-crypto/sha256-js": "5.2.0",
+    "@smithy/signature-v4": "5.4.5",
+    "@smithy/types": "4.14.2",
+    "aws-jwt-verify": "5.2.1"
+  },
+  "devDependencies": {
+    "@types/aws-lambda": "8.10.147"
+  }
+}

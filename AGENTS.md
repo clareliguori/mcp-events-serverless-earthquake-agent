@@ -33,8 +33,9 @@ its own `tsconfig.json` (composite project references) and `src/`.
 | `packages/subscription-manager/src` | `register.ts` (DynamoDB Stream → subscribe on both servers), `refresh.ts` (EventBridge → refresh/rotate), `secret.ts`, `handler.ts` (dual trigger).                                                                                                                                                                                   |
 | `packages/data-api/src`             | `handler.ts` + `router.ts` + `auth.ts` (dual auth) + `routes/{config,subscriptions,reports,trigger,session}.ts`.                                                                                                                                                                                                                      |
 | `packages/webapp/src`               | SvelteKit SPA. `lib/auth` (Cognito PKCE), `lib/api/client.ts`, `lib/{config,reports,conversation}`, `lib/components/ui` (shadcn-svelte), `routes/{config,reports,conversation}`.                                                                                                                                                      |
-| `packages/cdk/bin/app.ts`           | Instantiates the ten stacks and wires their dependencies.                                                                                                                                                                                                                                                                             |
-| `packages/cdk/lib`                  | One file per stack + `mcp-server-construct.ts` (shared by the two MCP server stacks), `shared-props.ts` (domain config), `dns-regional-stack.ts`, `dns-us-east-1-stack.ts`.                                                                                                                                                           |
+| `packages/webapp-auth-edge/src`     | CloudFront viewer-request Lambda@Edge Cognito auth gate for the webapp distribution: `handler.ts` (the gate), `oauth.ts` (PKCE authorize + code exchange), `cookies.ts`, `config.ts` (SSM-backed runtime config, since Lambda@Edge has no env vars).                                                                                   |
+| `packages/cdk/bin/app.ts`           | Instantiates the twelve stacks and wires their dependencies.                                                                                                                                                                                                                                                                            |
+| `packages/cdk/lib`                  | One file per stack + `mcp-server-construct.ts` (shared by the two MCP server stacks), `shared-props.ts` (domain config), `dns-regional-stack.ts`, `dns-us-east-1-stack.ts`, `webapp-auth-edge-stack.ts` (also pinned to us-east-1).                                                                                                    |
 | `packages/integration-tests/src`    | Black-box e2e against a deployed stack (`harness.ts`, `config.ts`, `e2e.test.ts`). See its `README.md`.                                                                                                                                                                                                                               |
 
 ## Standard development workflow
@@ -111,6 +112,19 @@ aws cloudformation describe-stacks --stack-name WebappStack --no-cli-pager \
 
 Then create a test user (next subsection) and drive the live URL with Playwright.
 
+**The deployed site is gated at the edge, so the flow differs from local dev.**
+Opening any URL on the deployed site redirects straight to the Cognito Hosted UI
+— there is no landing page yet and nothing to click. Fill the Hosted UI form
+first. You then land back on the app showing the SPA's **unauthenticated landing
+page**, and still have to click its "Sign in" button — which completes silently,
+with no second form, because the viewer already holds a Cognito session. So the
+deployed login is: Hosted UI form, then one click. Verified end to end against
+the live site.
+
+To sign out of the edge session (not just the SPA's in-memory one), visit
+`<APP_URL>/_auth/logout`. Clearing cookies works too; a stale `eqaAuthSession`
+cookie just sends you back through the Hosted UI.
+
 #### Option B — against the local dev server
 
 `npm run dev` serves the SPA on `http://localhost:5173` and loads `/config.json`
@@ -168,6 +182,21 @@ on each load, so no rebuild is needed):
 password is auto-generated and stored in Secrets Manager. A Custom Resource
 syncs the password to Cognito at deploy time - no manual step is needed.
 
+**The sync can silently drift, and it had.** The `AwsCustomResource` pins
+`physicalResourceId` to a constant and its properties only change when the secret
+changes, so CloudFormation invokes `adminSetUserPassword` essentially once at
+creation and never again. If the Cognito password diverges from the secret
+afterwards, every later deploy is a no-op and the Hosted UI just answers
+"Incorrect username or password" with the correct secret value. Re-sync by hand
+(this is exactly what the custom resource does):
+
+```bash
+aws cognito-idp admin-set-user-password --user-pool-id <UserPoolId> \
+  --username test-user@example.com --permanent --region <region> --no-cli-pager \
+  --password "$(aws secretsmanager get-secret-value --secret-id earthquake-agent-test-user \
+    --no-cli-pager --query SecretString --output text | jq -r .password)"
+```
+
 Retrieve the credentials on demand:
 
 ```bash
@@ -183,6 +212,12 @@ The user's `sub` (visible in the app as "Customer ID") is the `customerId` for
 that user's data.
 
 #### Logging in with Playwright
+
+On the **deployed** site (Option A) the edge gate has already redirected you to
+the Hosted UI, so skip the `open` + `click <signin-ref>` steps below and go
+straight to filling the form — then click the SPA's own "Sign in" afterwards to
+finish (it needs no password). On the **local dev server** (Option B), which is
+not gated, follow the steps as written.
 
 Click "Sign in" to redirect to the Cognito Hosted UI, fill the form, and submit.
 The flow returns to the app authenticated (the redirect carries the auth code;
@@ -298,7 +333,8 @@ it runs as part of `npm test`.
 - Because string-based `Fn.importValue` imports do not create deploy-time ordering, `bin/app.ts` declares each import relationship with `addDependency(...)` so `cdk deploy --all` creates exporters before importers. Keep that list in sync when you add a cross-stack import.
 - For deterministic values (such as custom-domain URLs derived from the shared domain name), pass them as Lambda environment variables or recompute them from `SharedProps` rather than importing, to avoid synth-time stack ordering dependencies.
 - Do not expose public construct properties on a stack class solely for another stack to read. Keep cross-stack contracts to the named CfnOutput/Fn.importValue surface.
-- Cross-region exception: `Fn.importValue` cannot resolve across regions. When a stack must consume a resource from a stack in a different region (for example, a CloudFront or Cognito custom-domain certificate that must live in us-east-1 while the app deploys to another region), enable `crossRegionReferences: true` on both stacks and pass the resource as a construct reference via props. This is the only sanctioned case for passing a construct across stacks; same-region sharing must still use named exports/imports.
+- Cross-region exception: `Fn.importValue` cannot resolve across regions. When a stack must consume a resource from a stack in a different region (for example, a CloudFront or Cognito custom-domain certificate that must live in us-east-1 while the app deploys to another region, or the Lambda@Edge auth-gate function version, which must also live in us-east-1), enable `crossRegionReferences: true` on both stacks and pass the resource as a construct reference via props. This is the only sanctioned case for passing a construct across stacks; same-region sharing must still use named exports/imports.
+  - For the auth gate specifically, passing the real `IVersion` construct (rather than rehydrating from an ARN string) is also what adds the `edgelambda.amazonaws.com` trust statement: CDK's `CacheBehavior` adds it when handed a Version whose role is a real construct. Do not also add that statement in `WebappAuthEdgeStack` or the trust policy ends up with it twice.
 
 ## CDK certificate regions
 
@@ -307,6 +343,41 @@ it runs as part of `npm test`.
 - Prefer one shared wildcard certificate per region over per-service certificates. ACM issues one deterministic DNS validation CNAME per FQDN, so multiple certificates for the same wildcard name share a single validation record; binding one certificate to multiple API Gateways is supported and the certificate ARN is stable across automatic renewals.
 
 ## Key implementation facts to respect
+
+- **The webapp distribution is gated at the edge, and the gate must stay on
+  `VIEWER_REQUEST`.** `WebappAuthEdgeStack` (pinned to us-east-1, because
+  Lambda@Edge functions must live there) attaches
+  `@mcp-events/webapp-auth-edge` to the CloudFront default behavior so no request
+  reaches S3 without a valid Cognito id token cookie. Four things about it are
+  load-bearing:
+
+  1. **`VIEWER_REQUEST`, never `ORIGIN_REQUEST`.** An origin trigger is skipped on
+     a cache hit, so a cached landing page would still be served anonymously.
+     Moving it would silently reopen the hole the gate exists to close.
+  2. **Lambda@Edge supports no environment variables**, and the User Pool id and
+     client id are CloudFormation tokens at synth time — so they can be delivered
+     neither as env vars nor baked into the bundle. `AuthStack` publishes them
+     into the SSM parameter named by `EDGE_AUTH_CONFIG_PARAMETER_NAME` (in the
+     **app** region) and the gate reads it once per cold start. Only the
+     parameter's *name* and *region* are synth-time constants, injected via
+     esbuild `bundling.define`. Adding config means adding it to that parameter,
+     not to `environment`.
+  3. **`externalModules: []` is deliberate.** CDK's `NodejsFunction` leaves
+     `@aws-sdk/*` external by default, expecting the Lambda runtime to provide it.
+     At the edge that is a bet on unresolvable requires failing every request to
+     the site, so the bundle is fully self-contained (Node builtins only) — which
+     is also why `config.ts` signs its own SSM call with `@smithy/signature-v4`
+     and reads credentials from the reserved env vars instead of using
+     `defaultProvider()`.
+  4. **The SPA is untouched by design.** It keeps its own in-memory PKCE flow
+     (Requirement 10.6); the gate's cookie is HttpOnly and is never read by page
+     JS. Both use the *same* public app client — the gate's
+     `/_auth/callback` is just another registered callback URL. The gate holds no
+     refresh token: when the id token expires it redirects to `/oauth2/authorize`
+     again, which Cognito satisfies silently from its own session cookie.
+
+  Reserved paths on the site are `/_auth/callback` and `/_auth/logout`; the gate
+  answers those itself and they never reach the origin.
 
 - **Webhook secret handling** (Requirement 17.9): the **Data API** Lambda is the
   only client-side encryptor/decryptor of its Subscriptions table secret — it
@@ -405,6 +476,14 @@ it runs as part of `npm test`.
 
 ## Monitoring gotchas
 
+- **The edge auth gate's logs are not where you will look for them, and no alarm
+  watches them.** Lambda@Edge writes to the region closest to the viewer, in log
+  groups named `/aws/lambda/us-east-1.<functionName>` in *that* region — not to a
+  single group in the app region. MonitoringStack's metric filters therefore do
+  not observe the gate at all, so a gate that is failing closed (every viewer
+  getting a 500 from `Edge auth gate failed`) pages nobody. If the site is
+  returning 500s, check those per-region log groups directly; the usual first
+  cause is the edge-config SSM parameter being missing or unreadable.
 - **The log-error metric filters match `WARN` as well as `ERROR`**
   (`addLogErrorAlarm` uses `FilterPattern.anyTerm("ERROR", "WARN")`), and each
   alarm fires at `Sum >= 1` over a single 5-minute period. So *any* single
@@ -433,8 +512,10 @@ trust the code:
 
 - A `packages/mcp-server-core` package exists that the design's component list
   does not mention; both MCP servers are built on it.
-- There are **ten** CDK stacks (DNS is split into `DnsRegionalStack` +
-  `DnsUsEast1Stack`), not the eight in the design's stack table.
+- There are **twelve** CDK stacks, not the eight in the design's stack table: DNS
+  is split into `DnsRegionalStack` + `DnsUsEast1Stack`, `MonitoringStack` is its
+  own stack, and `WebappAuthEdgeStack` (also us-east-1) carries the CloudFront
+  auth gate. (This list previously said ten, which undercounted.)
 - Webhook secret decryption is done by the **Data API**, not by the Webhook
   Receiver / Subscription Manager as some design component text implies. The
   code follows Requirement 17.9.
@@ -442,6 +523,12 @@ trust the code:
   pages). It is intentionally excluded from root ESLint and the root TS project
   references because it has its own SvelteKit toolchain (svelte-check, vite, its
   own vitest config).
+- The deployed site is **not** publicly reachable, which no spec requirement
+  describes: a viewer-request Lambda@Edge gate fronts the whole distribution.
+  Signing in on the deployed site is two steps — the Hosted UI form (the gate),
+  then the SPA's own "Sign in" button, which completes with no second form. The
+  SPA does not auto-initiate its login, so its unauthenticated landing page is
+  still shown to a gated viewer.
 
 If you change behavior that the spec describes, update the code first, then note
 the divergence (or update the spec if the task is spec-driven).
