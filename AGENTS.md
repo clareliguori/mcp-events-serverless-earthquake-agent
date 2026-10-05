@@ -393,8 +393,16 @@ it runs as part of `npm test`.
   is rejected. When adding a backend read, add or reuse a `/backend/...` route.
 - **Agent LLM**: Bedrock via the Strands SDK `BedrockModel`. Default model
   `us.anthropic.claude-haiku-4-5-20251001-v1:0`, overridable with the
-  `BEDROCK_MODEL_ID` env var. Sessions persist via the SDK `SessionManager` +
-  `S3Storage` (imported from `@strands-agents/sdk/session/s3-storage`) at
+  `BEDROCK_MODEL_ID` env var. The client is configured with
+  `clientConfig: { retryMode: "standard", maxAttempts: 10 }` (see
+  `accumulate.ts` `resolveModel`) because Bedrock returns transient 5xx at
+  ~0.9% of invocations and the SDK default of 3 attempts fires too fast to ride
+  them out. Ten standard-mode attempts cost at most ~25.5s of backoff (50ms
+  base, full jitter, 20s cap not reached until the 11th attempt), which fits
+  inside the 90s `withTimeout` guards around `agent.invoke()` — keep that
+  relationship in mind if you change either number. Sessions persist via the SDK
+  `SessionManager` + `S3Storage` (imported from
+  `@strands-agents/sdk/session/s3-storage`) at
   `sessions/{customerId}/scopes/agent/agent/snapshots/...`.
 - **Session writes are serialized** with `@deliveryhero/dynamodb-lock`
   (`agent/src/lock.ts`). Always go through `withLock(customerId, fn)`.
@@ -487,9 +495,15 @@ it runs as part of `npm test`.
 - **The log-error metric filters match `WARN` as well as `ERROR`**
   (`addLogErrorAlarm` uses `FilterPattern.anyTerm("ERROR", "WARN")`), and each
   alarm fires at `Sum >= 1` over a single 5-minute period. So *any* single
-  `console.warn` pages. Keep that in mind when adding a warn-level log on a
-  routine path — and conversely, it is what lets `fetchUsgsFeed` log a WARN per
-  retry and stay visible to the alarm even when the retry succeeds.
+  `console.warn` or `console.error` pages. Convention: **a failure that was
+  retried and recovered logs at INFO, not WARN.** Only a failure that is
+  actually unhandled should reach WARN/ERROR. `fetchUsgsFeed` follows this —
+  each retry and the eventual recovery log at INFO, and an exhausted retry
+  throws, which the Lambda runtime logs as `ERROR Invoke Error`. To check a log
+  line against the real filter before shipping, use
+  `aws logs test-metric-filter --filter-pattern '?"ERROR" ?"WARN"' --log-event-messages '<line>'`.
+  Terms are case-sensitive, so an INFO line can still trip the filter if its
+  message text contains the literal `ERROR` or `WARN`.
 - **`earthquake-agent-system-health` is a composite `anyOf` over every child
   alarm.** One chronically-failing child pins it in ALARM indefinitely, and
   because it never returns to OK it never re-notifies — so a single persistent

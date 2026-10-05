@@ -195,10 +195,15 @@ function isRetryableStatus(status: number): boolean {
  * Fetch and JSON-parse the USGS GeoJSON feed, retrying transient failures.
  *
  * Network-level rejections and retryable statuses ({@link isRetryableStatus})
- * are retried with the {@link FEED_RETRY_DELAYS_MS} backoff. Each retry logs a
- * `WARN`, which the stack's log-error metric filter counts (it matches both
- * `ERROR` and `WARN`) — so a blip that the retry papers over is still visible
- * and still alarms, while no longer failing the poll cycle or delaying events.
+ * are retried with the {@link FEED_RETRY_DELAYS_MS} backoff.
+ *
+ * Logging is deliberately split by outcome. Each retry, and a fetch that
+ * succeeds after retrying, logs at INFO — a blip the retry absorbed is not a
+ * problem, so it must not trip the stack's log-error metric filter (which
+ * matches `ERROR` and `WARN`) and page anyone. Only a fetch that fails outright
+ * is alarm-worthy, and that case throws: the error propagates out of the handler
+ * and the Lambda runtime logs it as `ERROR Invoke Error`, which the filter
+ * counts. The INFO lines keep the retry history searchable for diagnosis.
  *
  * @param feedUrl  Feed URL; defaults to the `USGS_FEED_URL` environment
  *                 variable supplied by the CDK stack.
@@ -242,6 +247,12 @@ export async function fetchUsgsFeed(
     }
 
     if ("feed" in outcome) {
+      if (attempt > 1) {
+        console.info("USGS feed fetch succeeded after retrying", {
+          attempts: attempt,
+          lastError: lastError?.message,
+        });
+      }
       return outcome.feed;
     }
 
@@ -251,7 +262,7 @@ export async function fetchUsgsFeed(
     }
 
     const retryInMs = FEED_RETRY_DELAYS_MS[attempt - 1];
-    console.warn("USGS feed fetch failed; retrying", {
+    console.info("USGS feed fetch failed; retrying", {
       attempt,
       maxAttempts,
       retryInMs,

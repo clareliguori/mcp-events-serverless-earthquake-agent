@@ -359,7 +359,23 @@ function resolveModel(): Model {
     return modelOverride;
   }
   const modelId = process.env.BEDROCK_MODEL_ID ?? DEFAULT_BEDROCK_MODEL_ID;
-  return new BedrockModel({ modelId });
+  return new BedrockModel({
+    modelId,
+    // Bedrock returns transient server-side 5xx at a low but steady rate
+    // (~0.9% of invocations in this account). The AWS SDK default of 3 attempts
+    // fires all of them inside about a second, which is too fast to ride out an
+    // InternalServerException that persists a few seconds — three such errors
+    // escaped to the agent over two weeks, each costing a 300s SQS redelivery
+    // and (because the queue is FIFO) blocking that customer's message group
+    // for those 5 minutes.
+    //
+    // Budget: `standard` mode uses a 50ms base with full jitter and a 20s cap,
+    // and the cap is not reached until the 11th attempt — so 10 attempts is at
+    // most ~25.5s of backoff (~13s on average), which fits inside the 90s
+    // withTimeout guards around agent.invoke(). `standard` also carries a retry
+    // quota, so a sustained Bedrock outage cannot turn into a retry storm.
+    clientConfig: { retryMode: "standard", maxAttempts: 10 },
+  });
 }
 
 // ---------------------------------------------------------------------------

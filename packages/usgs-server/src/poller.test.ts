@@ -121,17 +121,25 @@ afterAll(() => {
 });
 
 describe("fetchUsgsFeed", () => {
+  // The stack's log-error metric filter matches ERROR and WARN, so these spies
+  // pin the alarm contract: an absorbed blip must log neither.
   let warnSpy: ReturnType<typeof vi.spyOn>;
+  let errorSpy: ReturnType<typeof vi.spyOn>;
+  let infoSpy: ReturnType<typeof vi.spyOn>;
 
   beforeEach(() => {
     // Never wait on real backoff timers in unit tests.
     setFeedRetrySleepForTesting(async () => undefined);
     warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    infoSpy = vi.spyOn(console, "info").mockImplementation(() => undefined);
   });
 
   afterEach(() => {
     setFeedRetrySleepForTesting(undefined);
     warnSpy.mockRestore();
+    errorSpy.mockRestore();
+    infoSpy.mockRestore();
   });
 
   it("returns the parsed feed JSON on a 2xx response", async () => {
@@ -175,9 +183,25 @@ describe("fetchUsgsFeed", () => {
 
     expect(result).toEqual(feed);
     expect(calls).toBe(2);
-    // The recovered blip still logs a WARN, which the log-error metric filter
-    // counts — the retry must not make a transient failure invisible.
-    expect(warnSpy).toHaveBeenCalledTimes(1);
+    // A blip the retry absorbed is not alarm-worthy: nothing at WARN or ERROR,
+    // which the log-error metric filter would count and page on.
+    expect(warnSpy).not.toHaveBeenCalled();
+    expect(errorSpy).not.toHaveBeenCalled();
+    // ...but the retry history stays searchable at INFO for diagnosis.
+    expect(infoSpy).toHaveBeenCalledWith(
+      "USGS feed fetch failed; retrying",
+      expect.objectContaining({ attempt: 1, error: "fetch failed" }),
+    );
+    expect(infoSpy).toHaveBeenCalledWith(
+      "USGS feed fetch succeeded after retrying",
+      expect.objectContaining({ attempts: 2, lastError: "fetch failed" }),
+    );
+  });
+
+  it("does not log a recovery line when the first attempt succeeds", async () => {
+    const feed: UsgsFeatureCollection = { features: [] };
+    await fetchUsgsFeed("https://example.test/feed", stubFetch(feed));
+    expect(infoSpy).not.toHaveBeenCalled();
   });
 
   it("retries a retryable status then throws after the last attempt", async () => {
@@ -196,6 +220,11 @@ describe("fetchUsgsFeed", () => {
     ).rejects.toThrow(/503/);
 
     expect(calls).toBe(FEED_RETRY_DELAYS_MS.length + 1);
+    // The alarm signal for an outage is the throw itself: it propagates out of
+    // the handler and the Lambda runtime logs it as ERROR. The intermediate
+    // retries stay at INFO, so they never page on their own.
+    expect(warnSpy).not.toHaveBeenCalled();
+    expect(infoSpy).toHaveBeenCalledTimes(FEED_RETRY_DELAYS_MS.length);
   });
 
   it("does not retry a non-retryable client status", async () => {
